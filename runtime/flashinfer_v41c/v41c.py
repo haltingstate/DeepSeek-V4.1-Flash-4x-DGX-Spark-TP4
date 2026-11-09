@@ -1077,9 +1077,28 @@ def _frozen_tactics():
     return table
 
 
+# Same variable as SGLang's flash_mla_sm120.py pin (kk-digital/kcg-sglang#67); read raw here so an image without that
+# SGLang change still imports this module. The swan and v41n decodes return before that pin runs, so they read it here.
+PINNED_CPB_ENV = "SGLANG_FORCE_SM120_FLASHINFER_DSV4_DECODE_CHUNKS_PER_BLOCK"
+
+
+@lru_cache(maxsize=1)
+def _pinned_chunks_per_block():
+    raw = os.environ.get(PINNED_CPB_ENV, "").strip()
+    if not raw:
+        return None
+    pinned = int(raw)
+    if pinned < 1:
+        raise ValueError(f"{PINNED_CPB_ENV} must be >= 1, got {raw!r}")
+    return pinned
+
+
 def native_tactic(S, inputs, kw, hot_key) -> int:
     """The decode-dsv4 tactic (chunks_per_block) the STOCK call resolves for this shape, without tuning and without
     writing the stock caches. The tactic changes the split partition and so the merge order: native must run A's.
+    - SGLANG_FORCE_SM120_FLASHINFER_DSV4_DECODE_CHUNKS_PER_BLOCK set: min(that value, num_splits) for every shape, so a
+      row's split partition and merge order do not depend on the batch row count (the stock heuristic gives cpb 2 at
+      6 rows and cpb 3 at 12 rows for 16 heads and 10 splits);
     - AutoTuner in tuning mode: refuse (tune with the stock reader, then freeze its table);
     - DSV41_V41N_TACTICS set: that frozen table, fail closed on a missing shape;
     - else the stock hot cache, else the stock runner's AutoTuner lookup (non-tuning: cache lookup, -1 = the C++
@@ -1088,6 +1107,15 @@ def native_tactic(S, inputs, kw, hot_key) -> int:
     from flashinfer.autotuner import AutoTuner
 
     key = repr(hot_key)
+    pinned = _pinned_chunks_per_block()
+    if pinned is not None:
+        num_splits = int(hot_key[4])  # hot_key = (token bucket, heads, topk, extra_topk, num_splits, extras)
+        assert num_splits >= 1, f"decode shape {key} has no split"
+        # the kernel takes an override only in 1..num_splits (swan_decode_dsv4.cu, v41n_decode_dsv4.cu)
+        tactic = min(pinned, num_splits)
+        prev = native_tactics.setdefault(key, tactic)
+        assert prev == tactic, f"pinned tactic for {key} changed from {prev} to {tactic}"
+        return tactic
     tuner = AutoTuner.get()
     if tuner.is_tuning_mode:
         raise RuntimeError(f"{READER_ENV}=native never autotunes: tune with the stock reader and freeze its table "
